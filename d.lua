@@ -2,6 +2,11 @@ local Players = game:GetService("Players")
 local RunService = game:GetService("RunService")
 local UserInputService = game:GetService("UserInputService")
 local ReplicatedStorage = game:GetService("ReplicatedStorage")
+local VirtualInputManager = game:GetService("VirtualInputManager")
+local GunHandler
+pcall(function()
+    GunHandler = require(ReplicatedStorage:WaitForChild("Modules"):WaitForChild("GunHandler"))
+end)
 
 local localPlayer = Players.LocalPlayer
 local playerGui = localPlayer:WaitForChild("PlayerGui")
@@ -14,7 +19,7 @@ end
 local Rayfield = loadstring(game:HttpGet("https://sirius.menu/gen2"))()
 local window = Rayfield:CreateWindow({
     name = "VERTEX",
-    subtitle = "Combat & Visuals",
+    subtitle = "Combat, Rage & Visuals",
     sidebarLayout = true,
     theme = "cobalt",
     showName = "VERTEX",
@@ -29,6 +34,16 @@ local cfg = {
     aim = false,
     autoShoot = false,
     autoReload = false,
+    rage = false,
+    rageShoot = true,
+    rageStomp = true,
+    rageSlot = "1",
+    rageRadius = 8,
+    rageSpeed = 2.8,
+    ragePrediction = 0.12,
+    skySpam = false,
+    skyDistance = 1000000000,
+    skyInterval = 0.35,
     reloadKey = Enum.KeyCode.R,
     triggerTeam = true,
     protect = false,
@@ -99,6 +114,27 @@ local protectVersion = 0
 local protectDropdown
 local queueProtect
 local syncProtectSelection
+local protectPaused = false
+local rageDropdown
+local rageLabels = {}
+local rageTargetIds = {}
+local rageCurrentTarget
+local rageAngle = 0
+local rageLastStomp = 0
+local rageLastSky = 0
+local rageReturnUntil = 0
+local rageStompLockUntil = 0
+local rageStompReturnPending = false
+local rageStompPendingPlayer
+local rageStompPendingChar
+local rageStomped = setmetatable({}, { __mode = "k" })
+local rageEquipBusy = false
+local rageLastEquip = -math.huge
+local skyReturnCFrame
+local leaveVoid
+local stompKey = Enum.KeyCode.E
+local stompResultWait = 1.0
+local stompRetryDelay = 0.15
 
 local r15Links = {
     { "Head", "UpperTorso" },
@@ -790,6 +826,10 @@ local function processProtectQueue()
     end
 
     protectBusy = false
+    protectPaused = cfg.protect and #protectQueue > 0
+    if not cfg.skySpam and not cfg.rage and not heldCharacter() and leaveVoid then
+        leaveVoid()
+    end
     if cfg.protect and #protectQueue > 0 then
         task.defer(processProtectQueue)
     end
@@ -799,6 +839,7 @@ queueProtect = function(player, char, ko)
     if not cfg.protect or not protectedIds[player.UserId] or not ko.Value
         or protectHandled[char] or unloaded then return end
     protectHandled[char] = true
+    protectPaused = true
     table.insert(protectQueue, { player = player, char = char, ko = ko })
     task.defer(processProtectQueue)
 end
@@ -863,6 +904,7 @@ syncProtectSelection = function(selected)
         if id then protectedIds[id] = true end
     end
     table.clear(protectQueue)
+    protectPaused = false
     if cfg.protect then checkProtected() end
 end
 
@@ -874,7 +916,8 @@ local function gunEquipped()
             local ammo = tool:FindFirstChild("Ammo")
             local cooldown = tool:FindFirstChild("ShootingCooldown")
             if ammo and ammo:IsA("ValueBase") and cooldown and cooldown:IsA("ValueBase")
-                and tool:FindFirstChild("Range") and tool:FindFirstChild("Damage") then
+                and tool:FindFirstChild("Range") and tool:FindFirstChild("Damage")
+                and tool:FindFirstChild("Handle") then
                 return tool, ammo, cooldown
             end
         end
@@ -929,10 +972,152 @@ local function doAutoReload(ammo)
     end)
 end
 
-local function updateAutoShoot()
-    if not cfg.autoShoot and not cfg.autoReload then return end
+local function shootAtPlayer(player)
+    if protectBusy or protectPaused then return false end
+    if not player or player == localPlayer or not GunHandler
+        or type(GunHandler.Trace) ~= "function" then return false end
+    if UserInputService:GetFocusedTextBox() or _G.GUN_COMBAT_TOGGLE then return false end
+
     local tool, ammo, cooldown = gunEquipped()
+    if not tool then return false end
+
+    local char = localPlayer.Character
+    local targetChar = player.Character
+    local hum = char and char:FindFirstChildOfClass("Humanoid")
+    local targetHum = targetChar and targetChar:FindFirstChildOfClass("Humanoid")
+    local targetRoot = targetChar and targetChar:FindFirstChild("HumanoidRootPart")
+    local handle = tool:FindFirstChild("Handle")
+    local rangeValue = tool:FindFirstChild("Range")
+    local damageValue = tool:FindFirstChild("Damage")
+    if not char or not hum or hum.Health <= 0 or not targetChar or not targetHum
+        or targetHum.Health <= 0 or not targetRoot or not handle or not rangeValue or not damageValue then
+        return false
+    end
+
+    local effects = char:FindFirstChild("BodyEffects")
+    local ko = effects and effects:FindFirstChild("K.O")
+    local reloading = effects and effects:FindFirstChild("Reload")
+    if (ko and ko.Value) or (reloading and reloading.Value) then return false end
+
+    local targetEffects = targetChar:FindFirstChild("BodyEffects")
+    local targetKO = targetEffects and targetEffects:FindFirstChild("K.O")
+    local targetDead = targetEffects and targetEffects:FindFirstChild("Dead")
+    if (targetKO and targetKO.Value) or (targetDead and targetDead.Value)
+        or targetChar:FindFirstChildOfClass("ForceField") then
+        return false
+    end
+
+    if ammo.Value <= 0 then
+        doAutoReload(ammo)
+        return false
+    end
+
+    local canShoot = true
+    if type(GunHandler.GetCanShoot) == "function" then
+        local ok, result = pcall(GunHandler.GetCanShoot, char)
+        canShoot = ok and result ~= nil and result ~= false
+    end
+    if not canShoot then return false end
+
+    local range = tonumber(rangeValue.Value) or 0
+    local damage = tonumber(damageValue.Value) or 0
+    local tolerance = tool:FindFirstChild("ToleranceCooldown")
+    local delayTime = math.max(
+        (tonumber(cooldown.Value) or 0.12) + (tolerance and tonumber(tolerance.Value) or 0),
+        0.08
+    )
+    local now = os.clock()
+    if now - lastTrigger < delayTime then return false end
+
+    local default = tool:FindFirstChild("Default")
+    local mesh = default and default:FindFirstChild("Mesh")
+    local muzzle = mesh and mesh:FindFirstChild("Muzzle")
+    local origin = muzzle and muzzle.WorldPosition
+        or (handle.CFrame * CFrame.new(-1, 0.4, 0)).Position
+
+    local currentPos = targetRoot.Position
+    if (currentPos - origin).Magnitude > range then return false end
+
+    local params = RaycastParams.new()
+    params.FilterType = Enum.RaycastFilterType.Exclude
+    params.FilterDescendantsInstances = { char }
+    params.IgnoreWater = true
+    local visibleHit = workspace:Raycast(origin, currentPos - origin, params)
+    if not visibleHit or not visibleHit.Instance:IsDescendantOf(targetChar) then
+        return false
+    end
+
+    local aimPos = currentPos + targetRoot.AssemblyLinearVelocity * cfg.ragePrediction
+    if (aimPos - origin).Magnitude > range then return false end
+
+    local traced, hitPos, hitInstance, hitNormal = pcall(function()
+        return GunHandler.Trace({
+            Shooter = char,
+            Handle = handle,
+            ForcedOrigin = origin,
+            AimPosition = aimPos,
+            AimLockPart = targetRoot,
+            Hit = targetRoot,
+            Normal = Vector3.new(0, 1, 0),
+            Range = range,
+        })
+    end)
+    if not traced or typeof(hitPos) ~= "Vector3" or not hitInstance
+        or not hitInstance:IsDescendantOf(targetChar) then
+        return false
+    end
+
+    local aimDirection
+    local aimOK, result = pcall(GunHandler.GetAim, origin)
+    if aimOK and typeof(result) == "Vector3" and result.Magnitude > 0 then
+        aimDirection = result.Unit
+    else
+        aimDirection = (aimPos - origin).Unit
+    end
+
+    local fired = pcall(function()
+        mainRemote:FireServer(
+            "ShootGun",
+            handle,
+            origin,
+            nil,
+            hitPos,
+            hitInstance,
+            hitNormal or Vector3.new(0, 1, 0),
+            range,
+            damage,
+            origin + aimDirection * range,
+            targetRoot
+        )
+    end)
+    if not fired then return false end
+
+    lastTrigger = now
+    task.defer(function()
+        pcall(function()
+            GunHandler.Shoot({
+                Precomputed = true,
+                Shooter = char,
+                Handle = handle,
+                ForcedOrigin = origin,
+                AimPosition = hitPos,
+                BeamColor = cfg.accent,
+                Range = range,
+                HitPosition = hitPos,
+                HitInstance = hitInstance,
+                HitNormal = hitNormal or Vector3.new(0, 1, 0),
+            })
+        end)
+    end)
+    return true
+end
+
+local function updateAutoShoot()
+    if protectBusy or protectPaused then return end
+    if not cfg.autoShoot and not cfg.autoReload then return end
+    local tool, ammo = gunEquipped()
     if not tool then return end
+
     local char = localPlayer.Character
     local effects = char and char:FindFirstChild("BodyEffects")
     local ko = effects and effects:FindFirstChild("K.O")
@@ -944,13 +1129,9 @@ local function updateAutoShoot()
         return
     end
 
-    if not cfg.autoShoot or UserInputService:GetFocusedTextBox() or not mousePlayer() then return end
-    local delayTime = math.max(tonumber(cooldown.Value) or 0.12, 0.08)
-    if os.clock() - lastTrigger < delayTime then return end
-    if _G.GUN_COMBAT_TOGGLE then return end
-    lastTrigger = os.clock()
-    tool:Activate()
-    tool:Deactivate()
+    if not cfg.autoShoot or cfg.rage then return end
+    local player = mousePlayer()
+    if player then shootAtPlayer(player) end
 end
 
 local movementHum
@@ -1093,6 +1274,331 @@ local function copyCFrame()
     window:Notify({ title = "CFrame", content = "Clipboard unavailable. CFrame printed to console." })
 end
 
+local function rageTargetState(player)
+    local char = player and player.Character
+    if not char then return "invalid" end
+
+    local hum = char:FindFirstChildOfClass("Humanoid")
+    local effects = char:FindFirstChild("BodyEffects")
+    local ko = effects and effects:FindFirstChild("K.O")
+    local dead = effects and effects:FindFirstChild("Dead")
+
+    if dead and dead.Value then return "dead" end
+    if char:FindFirstChildOfClass("ForceField") then return "forcefield" end
+    if char:FindFirstChild("GRABBING_CONSTRAINT") then return "grabbed" end
+    if ko and ko.Value then return "knocked" end
+    if not hum or hum.Health <= 0 then return "dead" end
+    return "alive"
+end
+
+local function refreshRageTargets()
+    if not rageDropdown then return end
+    local options, labels = {}, {}
+    for _, player in Players:GetPlayers() do
+        if player ~= localPlayer then
+            local label = ("@%s [%d]"):format(player.Name, player.UserId)
+            labels[label] = player.UserId
+            table.insert(options, label)
+        end
+    end
+    table.sort(options)
+    rageLabels = labels
+    rageDropdown:Refresh(options)
+    local selected = {}
+    for label, id in pairs(labels) do
+        if rageTargetIds[id] then
+            table.insert(selected, label)
+        end
+    end
+    pcall(function() rageDropdown:SetValue(selected) end)
+end
+
+local function syncRageSelection(selected)
+    table.clear(rageTargetIds)
+    for _, label in (selected or {}) do
+        local id = rageLabels[label]
+        if id then rageTargetIds[id] = true end
+    end
+    rageCurrentTarget = nil
+end
+
+local function equipRageSlot()
+    if rageEquipBusy or UserInputService:GetFocusedTextBox()
+        or os.clock() - rageLastEquip < 0.65 then return end
+    local key = ({
+        ["1"] = Enum.KeyCode.One,
+        ["2"] = Enum.KeyCode.Two,
+        ["3"] = Enum.KeyCode.Three,
+    })[tostring(cfg.rageSlot)]
+    if not key then return end
+
+    rageEquipBusy = true
+    rageLastEquip = os.clock()
+    task.spawn(function()
+        pcall(function()
+            VirtualInputManager:SendKeyEvent(true, key, false, game)
+            task.wait(0.05)
+            VirtualInputManager:SendKeyEvent(false, key, false, game)
+        end)
+        task.wait(0.12)
+        rageEquipBusy = false
+    end)
+end
+
+local function teleportToVoid()
+    local char = localPlayer.Character
+    local hum = char and char:FindFirstChildOfClass("Humanoid")
+    local root = char and char:FindFirstChild("HumanoidRootPart")
+    if not char or not root or (hum and hum.Health <= 0) then return false end
+
+    if not skyReturnCFrame then
+        skyReturnCFrame = char:GetPivot()
+    end
+
+    local direction = Vector3.new(
+        math.random(-1000, 1000),
+        math.random(100, 1000),
+        math.random(-1000, 1000)
+    )
+    if direction.Magnitude < 1 then
+        direction = Vector3.new(1, 1, 0)
+    end
+
+    local position = skyReturnCFrame.Position + direction.Unit * cfg.skyDistance
+    local ok = pcall(function()
+        char:PivotTo(CFrame.new(position))
+        root.AssemblyLinearVelocity = Vector3.zero
+        root.AssemblyAngularVelocity = Vector3.zero
+    end)
+    if ok then
+        rageLastSky = os.clock()
+    end
+    return ok
+end
+
+leaveVoid = function()
+    local char = localPlayer.Character
+    if char and skyReturnCFrame then
+        pcall(function()
+            char:PivotTo(skyReturnCFrame)
+            local root = char:FindFirstChild("HumanoidRootPart")
+            if root then
+                root.AssemblyLinearVelocity = Vector3.zero
+                root.AssemblyAngularVelocity = Vector3.zero
+            end
+        end)
+    end
+    skyReturnCFrame = nil
+end
+
+local function getRageTarget()
+    local own = localPlayer.Character
+    local ownRoot = own and own:FindFirstChild("HumanoidRootPart")
+    local nearest, nearestDistance = nil, math.huge
+    local now = os.clock()
+
+    for _, player in Players:GetPlayers() do
+        if rageTargetIds[player.UserId] then
+            local state = rageTargetState(player)
+            local char = player.Character
+            local stompState = char and rageStomped[char]
+
+            if state == "alive" and char then
+                rageStomped[char] = nil
+                stompState = nil
+            elseif state == "knocked" and cfg.rageStomp and char and not stompState then
+                stompState = {
+                    knockedAt = now,
+                    attempts = 0,
+                    nextAttempt = now + 1,
+                }
+                rageStomped[char] = stompState
+            end
+
+            local canStomp = state == "knocked" and cfg.rageStomp
+                and stompState and stompState.attempts < 4
+            if state == "alive" or canStomp then
+                local root = char and char:FindFirstChild("HumanoidRootPart")
+                if root then
+                    local distance = ownRoot and (root.Position - ownRoot.Position).Magnitude or 0
+                    if distance < nearestDistance then
+                        nearest, nearestDistance = player, distance
+                    end
+                end
+            end
+        end
+    end
+    return nearest
+end
+
+local function orbitTarget(player, dt)
+    local char = localPlayer.Character
+    local root = char and char:FindFirstChild("HumanoidRootPart")
+    local targetChar = player.Character
+    local targetRoot = targetChar and targetChar:FindFirstChild("HumanoidRootPart")
+    if not root or not targetRoot then return end
+
+    rageAngle += dt * cfg.rageSpeed
+    local offset = Vector3.new(
+        math.cos(rageAngle) * cfg.rageRadius,
+        2.5,
+        math.sin(rageAngle) * cfg.rageRadius
+    )
+    local position = targetRoot.Position + offset
+    root.CFrame = CFrame.lookAt(position, targetRoot.Position)
+    root.AssemblyLinearVelocity = Vector3.zero
+end
+
+local function tryRageStomp(player)
+    local now = os.clock()
+    local targetChar = player and player.Character
+    if not targetChar then return false end
+
+    local state = rageStomped[targetChar]
+    if not state then
+        state = { knockedAt = now, attempts = 0, nextAttempt = now + 1 }
+        rageStomped[targetChar] = state
+    end
+    if state.attempts >= 4 or now < state.nextAttempt or rageStompReturnPending then
+        return false
+    end
+    if rageTargetState(player) ~= "knocked" then
+        rageStomped[targetChar] = nil
+        rageCurrentTarget = nil
+        return false
+    end
+
+    local torso = targetChar:FindFirstChild("LowerTorso")
+        or targetChar:FindFirstChild("Torso")
+        or targetChar:FindFirstChild("HumanoidRootPart")
+    local char = localPlayer.Character
+    local root = char and char:FindFirstChild("HumanoidRootPart")
+    if not torso or not root then return false end
+
+    local positioned = pcall(function()
+        root.CFrame = CFrame.lookAt(torso.Position + Vector3.new(0, 3.5, 0), torso.Position)
+        root.AssemblyLinearVelocity = Vector3.zero
+        root.AssemblyAngularVelocity = Vector3.zero
+    end)
+    if not positioned then
+        state.nextAttempt = now + 1
+        return false
+    end
+
+    local pressed = pcall(function()
+        VirtualInputManager:SendKeyEvent(true, stompKey, false, game)
+    end)
+    if not pressed then
+        state.nextAttempt = now + 1
+        return false
+    end
+
+    task.delay(0.06, function()
+        pcall(function()
+            VirtualInputManager:SendKeyEvent(false, stompKey, false, game)
+        end)
+    end)
+
+    state.attempts += 1
+    state.nextAttempt = now + stompResultWait + stompRetryDelay
+    rageLastStomp = now
+    rageStompLockUntil = now + stompResultWait
+    rageStompReturnPending = true
+    rageStompPendingPlayer = player
+    rageStompPendingChar = targetChar
+    return true
+end
+
+local function updateRage(dt)
+    if unloaded or protectBusy or protectPaused then return end
+
+    local now = os.clock()
+    if rageStompReturnPending then
+        if now < rageStompLockUntil then return end
+        rageStompReturnPending = false
+        rageStompLockUntil = 0
+
+        local player = rageStompPendingPlayer
+        local targetChar = rageStompPendingChar
+        rageStompPendingPlayer = nil
+        rageStompPendingChar = nil
+
+        if player and player.Character == targetChar
+            and rageTargetState(player) == "knocked" then
+            local state = rageStomped[targetChar]
+            if state and state.attempts >= 4 then
+                state.exhausted = true
+                if rageCurrentTarget == player then rageCurrentTarget = nil end
+            else
+                rageCurrentTarget = player
+            end
+        else
+            if targetChar then rageStomped[targetChar] = nil end
+            if rageCurrentTarget == player then rageCurrentTarget = nil end
+        end
+
+        if cfg.rage or cfg.skySpam then
+            teleportToVoid()
+        end
+        return
+    end
+
+    if cfg.rage then
+        local target = rageCurrentTarget
+        if target and (not rageTargetIds[target.UserId] or not target.Parent) then
+            rageCurrentTarget = nil
+            target = nil
+        end
+
+        if target then
+            local state = rageTargetState(target)
+            if state == "dead" or state == "invalid" then
+                rageCurrentTarget = nil
+                teleportToVoid()
+                rageReturnUntil = os.clock() + 0.25
+                return
+            end
+        end
+
+        if os.clock() < rageReturnUntil then
+            if cfg.skySpam and os.clock() - rageLastSky >= cfg.skyInterval then
+                teleportToVoid()
+            end
+            return
+        end
+
+        if not target then
+            rageCurrentTarget = getRageTarget()
+            target = rageCurrentTarget
+        end
+
+        if target then
+            local state = rageTargetState(target)
+            if state == "alive" then
+                local char = target.Character
+                if char then rageStomped[char] = nil end
+                orbitTarget(target, dt)
+                if cfg.rageShoot then
+                    if not gunEquipped() then
+                        equipRageSlot()
+                    else
+                        shootAtPlayer(target)
+                    end
+                end
+            elseif state == "knocked" and cfg.rageStomp then
+                tryRageStomp(target)
+            else
+                rageCurrentTarget = nil
+            end
+            return
+        end
+    end
+
+    if cfg.skySpam and os.clock() - rageLastSky >= cfg.skyInterval then
+        teleportToVoid()
+    end
+end
+
 local aimTab = window:CreateTab({ name = "Aimbot", icon = 100604009889706 })
 aimTab:CreateSection({ name = "Targeting" })
 local aimToggle = aimTab:CreateToggle({
@@ -1204,6 +1710,7 @@ local protectToggle = protectTab:CreateToggle({
         cfg.protect = value
         protectVersion += 1
         table.clear(protectQueue)
+        if not value then protectPaused = false end
         if value then
             table.clear(protectHandled)
             checkProtected()
@@ -1222,7 +1729,94 @@ protectTab:CreateButton({
 })
 protectTab:CreateText({
     name = "Rescue Behavior",
-    text = "Up to five grab attempts per KO. After pickup, waits 0.5s, teleports to (749.7, 112, -669.5), waits for arrival and settles 0.5s, releases, confirms the drop, then returns. If release fails, it stays at the drop-off.",
+    text = "Up to five grab attempts per KO. After pickup, waits 0.5s, teleports to (749.7, 112, -669.5), waits for arrival and settles 0.5s, releases, confirms the drop, then returns. If release fails, it stays at the drop-off. Rage and Sky Spam pause immediately during rescue and resume afterward.",
+})
+
+local rageTab = window:CreateTab({ name = "Rage", icon = 129180860773723 })
+rageTab:CreateSection({ name = "Automation" })
+local rageToggle = rageTab:CreateToggle({
+    name = "Enable Ragebot", flag = "rageEnabled", value = cfg.rage,
+    description = "Cycles selected targets, orbits their HumanoidRootPart, shoots verified traces, waits 1 second after KO, presses E, then checks the stomp after 1 second. Up to four attempts.",
+    callback = function(value)
+        cfg.rage = value
+        rageCurrentTarget = nil
+        if value then
+            rageLastEquip = -math.huge
+            local char = localPlayer.Character
+            if char and not skyReturnCFrame then skyReturnCFrame = char:GetPivot() end
+            if not protectBusy and not protectPaused then equipRageSlot() end
+        elseif not cfg.skySpam and not protectBusy and not protectPaused then
+            leaveVoid()
+        end
+    end,
+})
+local skySpamToggle = rageTab:CreateToggle({
+    name = "Sky Spam", flag = "rageSkySpam", value = cfg.skySpam,
+    description = "Teleports to a random position about one billion studs from the map while idle. Pauses for Auto Protect.",
+    callback = function(value)
+        cfg.skySpam = value
+        if value then
+            if not protectBusy and not protectPaused then teleportToVoid() end
+        elseif not cfg.rage and not protectBusy and not protectPaused then
+            leaveVoid()
+        end
+    end,
+})
+local rageShootToggle = rageTab:CreateToggle({
+    name = "Auto Shoot", flag = "rageAutoShoot", value = cfg.rageShoot,
+    callback = function(value) cfg.rageShoot = value end,
+})
+local rageStompToggle = rageTab:CreateToggle({
+    name = "Auto Stomp", flag = "rageAutoStomp", value = cfg.rageStomp,
+    callback = function(value) cfg.rageStomp = value end,
+})
+
+rageTab:CreateSection({ name = "Target" })
+rageTab:CreateText({
+    name = "Target",
+    text = "Select multiple players. Vertex handles one target at a time, then moves to the next selected player.",
+})
+rageDropdown = rageTab:CreateDropdown({
+    name = "Players", flag = "rageTargets", multiSelect = true,
+    options = {}, value = {}, placeholder = "Select targets...",
+    description = "Selected players are tracked by UserId and refreshed when players join or leave.",
+    callback = function(selected) syncRageSelection(selected) end,
+})
+rageTab:CreateButton({
+    name = "Refresh Targets",
+    callback = refreshRageTargets,
+})
+
+rageTab:CreateSection({ name = "Orbit & Weapon" })
+local rageSlotDropdown = rageTab:CreateDropdown({
+    name = "Gun Hotbar Slot", flag = "rageGunSlot",
+    options = { "1", "2", "3" }, value = cfg.rageSlot,
+    description = "Equips the selected Roblox hotbar slot before firing.",
+    callback = function(value)
+        cfg.rageSlot = type(value) == "table" and value[1] or value or "1"
+        rageLastEquip = -math.huge
+        equipRageSlot()
+    end,
+})
+local rageRadiusSlider = rageTab:CreateSlider({
+    name = "Orbit Radius", flag = "rageOrbitRadius", range = { 3, 20 }, increment = 1,
+    value = cfg.rageRadius, suffix = " studs",
+    callback = function(value) cfg.rageRadius = value end,
+})
+local rageSpeedSlider = rageTab:CreateSlider({
+    name = "Orbit Speed", flag = "rageOrbitSpeed", range = { 1, 12 }, increment = 0.5,
+    value = cfg.rageSpeed, suffix = "x",
+    callback = function(value) cfg.rageSpeed = value end,
+})
+local ragePredictionSlider = rageTab:CreateSlider({
+    name = "Movement Prediction", flag = "ragePrediction", range = { 0, 0.5 }, increment = 0.01,
+    value = cfg.ragePrediction, suffix = " s",
+    description = "Leads moving targets, then fires only when the game trace confirms the target is hit.",
+    callback = function(value) cfg.ragePrediction = value end,
+})
+rageTab:CreateText({
+    name = "Silent Aim / Shot Validation",
+    text = "Redirects rage shots to the selected player's HumanoidRootPart without moving your camera. Uses GunHandler.Trace and skips shots that are out of range, blocked, or do not trace onto that target.",
 })
 
 local espTab = window:CreateTab({ name = "Visuals", icon = 80387863064905 })
@@ -1378,7 +1972,7 @@ miscTab:CreateButton({
 })
 miscTab:CreateSection({ name = "About" })
 miscTab:CreateText({
-    name = "VERTEX / Gen2",
+    name = "VERTEX / V7",
     text = "Screen-centered FOV, independent X/Y camera smoothing, sticky targeting, and UI-based ESP. Hold mode releases instantly when the activation key is lifted.",
 })
 miscTab:CreateButton({
@@ -1440,6 +2034,23 @@ end
 for _, player in Players:GetPlayers() do watchProtected(player) end
 refreshProtected()
 syncProtectSelection(protectDropdown.value)
+refreshRageTargets()
+syncRageSelection(rageDropdown.value)
+cfg.rage = rageToggle.value
+cfg.skySpam = skySpamToggle.value
+cfg.rageShoot = rageShootToggle.value
+cfg.rageStomp = rageStompToggle.value
+local slotValue = rageSlotDropdown.value
+cfg.rageSlot = type(slotValue) == "table" and slotValue[1] or slotValue or cfg.rageSlot
+cfg.rageRadius = rageRadiusSlider.value
+cfg.rageSpeed = rageSpeedSlider.value
+cfg.ragePrediction = ragePredictionSlider.value
+if cfg.rage then
+    local char = localPlayer.Character
+    if char and not skyReturnCFrame then skyReturnCFrame = char:GetPivot() end
+    rageLastEquip = -math.huge
+    equipRageSlot()
+end
 if cfg.protect then checkProtected() end
 
 local function matchesKey(input)
@@ -1454,6 +2065,7 @@ end)
 connections[#connections + 1] = Players.PlayerAdded:Connect(function(player)
     watchProtected(player)
     task.defer(refreshProtected)
+    task.defer(refreshRageTargets)
 end)
 connections[#connections + 1] = Players.PlayerRemoving:Connect(function(player)
     removeVisual(player)
@@ -1464,7 +2076,18 @@ connections[#connections + 1] = Players.PlayerRemoving:Connect(function(player)
         protectWatchers[player] = nil
     end
     protectedIds[player.UserId] = nil
+    rageTargetIds[player.UserId] = nil
+    if rageCurrentTarget == player then rageCurrentTarget = nil end
     task.defer(refreshProtected)
+    task.defer(refreshRageTargets)
+end)
+connections[#connections + 1] = localPlayer.CharacterAdded:Connect(function()
+    task.delay(0.5, function()
+        if cfg.rage and not unloaded then
+            rageLastEquip = -math.huge
+            equipRageSlot()
+        end
+    end)
 end)
 connections[#connections + 1] = workspace.DescendantAdded:Connect(function(obj)
     if cfg.performance then optimizeEffect(obj) end
@@ -1475,6 +2098,7 @@ end)
 
 connections[#connections + 1] = RunService.Heartbeat:Connect(function(dt)
     if cfg.fly then updateFly() end
+    updateRage(dt)
     movementElapsed += dt
     if movementElapsed >= 0.2 then
         movementElapsed = 0
@@ -1535,6 +2159,11 @@ end)
 local function unload()
     if unloaded then return end
     unloaded = true
+    cfg.rage = false
+    cfg.skySpam = false
+    protectPaused = false
+    rageCurrentTarget = nil
+    if not heldCharacter() then leaveVoid() end
     RunService:UnbindFromRenderStep(renderName)
     stopFly()
     local hum = movementHum
@@ -1566,4 +2195,7 @@ local function unload()
 end
 
 env.VertexUnload = unload
+if not GunHandler then
+    warn("[VERTEX] GunHandler could not be loaded; verified shooting is unavailable.")
+end
 window:Notify({ title = "VERTEX", content = "Loaded. Set a key, then enable the modules you want." })
